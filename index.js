@@ -8,11 +8,24 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 const port = process.env.PORT || 3000
 
 //middleware
+// CORS: allow local dev origins and handle preflight
+const allowedOrigins = ['http://localhost:5173', 'http://localhost:3000', 'https://server-asset-verse-7z8honkcg-chamok-bhadras-projects.vercel.app'];
+const corsOptions = {
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 200
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
-app.use(cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000', 'https://your-client-domain.vercel.app'],
-    credentials: true
-}));
 app.use(cookieParser());
 
 
