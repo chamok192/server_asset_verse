@@ -73,7 +73,29 @@ async function connectDB() {
 
 connectDB();
 
-app.post('/api/auth/login', async (req, res) => {
+// Ensure DB connection is ready before handling requests
+let dbReady;
+const ensureDb = async (req, res, next) => {
+    try {
+        if (!dbReady) {
+            dbReady = (async () => {
+                if (!usersCollection) {
+                    await connectDB();
+                }
+            })();
+        }
+        await dbReady;
+        if (!usersCollection) {
+            return res.status(503).json({ success: false, error: 'Database not ready' });
+        }
+        next();
+    } catch (err) {
+        console.error('ensureDb error:', err);
+        return res.status(500).json({ success: false, error: 'Database connection failed' });
+    }
+};
+
+app.post('/api/auth/login', ensureDb, async (req, res) => {
     try {
         const { email } = req.body;
         const user = await usersCollection.findOne({ email: email });
@@ -94,7 +116,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-app.get('/api/users/email/:email', verifyToken, async (req, res) => {
+app.get('/api/users/email/:email', verifyToken, ensureDb, async (req, res) => {
     try {
         const user = await usersCollection.findOne({ email: req.params.email });
         res.send(user);
@@ -103,7 +125,7 @@ app.get('/api/users/email/:email', verifyToken, async (req, res) => {
     }
 });
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', ensureDb, async (req, res) => {
     try {
         const user = req.body;
         
@@ -114,6 +136,7 @@ app.post('/api/users', async (req, res) => {
             });
         }
 
+        console.log('Registering user:', { email: user.email, uid: user.uid });
         const result = await usersCollection.insertOne({
             ...user,
             createdAt: new Date()
@@ -124,6 +147,7 @@ app.post('/api/users', async (req, res) => {
             data: result 
         });
     } catch (error) {
+        console.error('Failed to create user:', error);
         res.status(500).json({ 
             success: false, 
             error: error.message 
@@ -131,7 +155,7 @@ app.post('/api/users', async (req, res) => {
     }
 });
 
-app.get('/api/users', verifyToken, verifyHR, async (req, res) => {
+app.get('/api/users', verifyToken, ensureDb, verifyHR, async (req, res) => {
     try {
         const users = await usersCollection.find().toArray();
         res.send(users);
@@ -140,7 +164,7 @@ app.get('/api/users', verifyToken, verifyHR, async (req, res) => {
     }
 });
 
-app.patch('/api/users/:id/role', verifyToken, verifyHR, async (req, res) => {
+app.patch('/api/users/:id/role', verifyToken, ensureDb, verifyHR, async (req, res) => {
     try {
         const { ObjectId } = require('mongodb');
         const result = await usersCollection.updateOne(
