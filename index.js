@@ -12,7 +12,7 @@ app.use(express.json());
 app.use(cors({
     origin: ['http://localhost:5173', 'http://localhost:3000'],
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -269,17 +269,28 @@ app.get('/api/assets/:id', verifyToken, ensureDb, async (req, res) => {
     }
 });
 
-app.patch('/api/assets/:id', verifyToken, ensureDb, async (req, res) => {
+app.patch('/api/assets/:id', verifyToken, ensureDb, verifyHR, async (req, res) => {
     try {
         const assetData = req.body;
-        const updates = {
+                const updates = {
             name: assetData.name,
             image: assetData.image,
             type: assetData.type,
             quantity: Number(assetData.quantity),
             updatedAt: new Date()
         };
+        
+        console.log('[PATCH] Raw param ID:', req.params.id, 'Type:', typeof req.params.id);
+        console.log('[PATCH] ID length:', req.params.id?.length, 'Is valid hex:', /^[0-9a-fA-F]{24}$/.test(req.params.id));
+        console.log('[PATCH /api/assets] Param ID:', req.params.id);
+        console.log('[PATCH /api/assets] Updates:', updates);
 
+        // Check if asset exists first
+        const checkAsset = await assetsCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!checkAsset) {
+            console.log('[PATCH] Asset not found');
+            return res.status(404).json({ success: false, error: 'Asset not found' });
+        }
         const result = await assetsCollection.findOneAndUpdate(
             { _id: new ObjectId(req.params.id) },
             { $set: updates },
@@ -361,3 +372,12 @@ app.listen(port, () => {
 })
 
 module.exports = app;
+
+
+
+
+
+
+
+
+
