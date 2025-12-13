@@ -2,31 +2,19 @@ const express = require('express')
 const app = express();
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
 require('dotenv').config();
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
+const { buildAssetDocument, validateAsset } = require('./src/utils/assetSchema');
 const port = process.env.PORT || 3000
 
-//middleware
-// CORS: allow local dev origins and handle preflight
-const allowedOrigins = ['http://localhost:5173', 'http://localhost:3000', 'https://server-asset-verse-7z8honkcg-chamok-bhadras-projects.vercel.app'];
-const corsOptions = {
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
+app.use(express.json());
+app.use(cors({
+    origin: ['http://localhost:5173', 'http://localhost:3000'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    optionsSuccessStatus: 200
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-app.use(express.json());
-app.use(cookieParser());
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.gtbyi48.mongodb.net/?appName=Cluster0`;
@@ -56,20 +44,19 @@ const verifyToken = (req, res, next) => {
 };
 
 const verifyHR = async (req, res, next) => {
-    const email = req.user.email;
-    const database = client.db("assetVerse");
-    const usersCollection = database.collection("users");
-    
-    const user = await usersCollection.findOne({ email: email });
+    const user = await usersCollection.findOne({ email: req.user.email });
     
     if (user?.role !== 'HR' && user?.role !== 'Admin') {
-        return res.status(403).send({ message: 'Forbidden access' });
+        return res.status(403).json({ success: false, error: 'Forbidden access' });
     }
     
     next();
 };
 
 let usersCollection;
+let assetsCollection;
+let requestsCollection;
+let paymentsCollection;
 
 async function connectDB() {
     try {
@@ -79,6 +66,9 @@ async function connectDB() {
         
         const database = client.db("assetVerse");
         usersCollection = database.collection("users");
+        assetsCollection = database.collection("assets");
+        requestsCollection = database.collection("requests");
+        paymentsCollection = database.collection("payments");
     } catch (error) {
         console.error("MongoDB connection error:", error);
     }
@@ -86,26 +76,11 @@ async function connectDB() {
 
 connectDB();
 
-// Ensure DB connection is ready before handling requests
-let dbReady;
 const ensureDb = async (req, res, next) => {
-    try {
-        if (!dbReady) {
-            dbReady = (async () => {
-                if (!usersCollection) {
-                    await connectDB();
-                }
-            })();
-        }
-        await dbReady;
-        if (!usersCollection) {
-            return res.status(503).json({ success: false, error: 'Database not ready' });
-        }
-        next();
-    } catch (err) {
-        console.error('ensureDb error:', err);
-        return res.status(500).json({ success: false, error: 'Database connection failed' });
+    if (!usersCollection) {
+        return res.status(503).json({ success: false, error: 'Database not ready' });
     }
+    next();
 };
 
 app.post('/api/auth/login', ensureDb, async (req, res) => {
@@ -140,24 +115,31 @@ app.get('/api/users/email/:email', verifyToken, ensureDb, async (req, res) => {
 
 app.post('/api/users', ensureDb, async (req, res) => {
     try {
-        const user = req.body;
+        const userData = req.body;
         
-        if (!user.email || !user.uid) {
+        const { valid, errors } = validateUser(userData);
+        if (!valid) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Email and UID are required' 
+                errors 
             });
         }
 
-        console.log('Registering user:', { email: user.email, uid: user.uid });
-        const result = await usersCollection.insertOne({
-            ...user,
-            createdAt: new Date()
-        });
+        const existingUser = await usersCollection.findOne({ email: userData.email });
+        if (existingUser) {
+            return res.status(409).json({ 
+                success: false, 
+                error: 'User already exists' 
+            });
+        }
+
+        const userDocument = buildUserDocument(userData);
+        const result = await usersCollection.insertOne(userDocument);
 
         res.json({ 
             success: true, 
-            data: result 
+            data: result,
+            user: userDocument
         });
     } catch (error) {
         console.error('Failed to create user:', error);
@@ -165,6 +147,46 @@ app.post('/api/users', ensureDb, async (req, res) => {
             success: false, 
             error: error.message 
         });
+    }
+});
+
+app.get('/api/users/profile', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const user = await usersCollection.findOne({ email });
+        if (!user) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        res.json({ success: true, data: user });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.patch('/api/users/profile', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const email = req.user.email;
+        const updates = req.body;
+        
+        delete updates.role;
+        delete updates.email;
+        delete updates.uid;
+        
+        updates.updatedAt = new Date();
+        
+        const result = await usersCollection.findOneAndUpdate(
+            { email },
+            { $set: updates },
+            { returnDocument: 'after' }
+        );
+        
+        if (!result.value) {
+            return res.status(404).json({ success: false, error: 'User not found' });
+        }
+        
+        res.json({ success: true, data: result.value });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -187,6 +209,146 @@ app.patch('/api/users/:id/role', verifyToken, ensureDb, verifyHR, async (req, re
         res.send(result);
     } catch (error) {
         res.status(500).send({ error: error.message });
+    }
+});
+
+app.post('/api/assets', verifyToken, ensureDb, verifyHR, async (req, res) => {
+    try {
+        const { name, image, type, quantity } = req.body;
+        console.log('Creating asset:', { name, image, type, quantity });
+        
+        if (!name || !type || quantity === undefined) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Name, type, and quantity are required' 
+            });
+        }
+
+        const asset = {
+            name,
+            image: image || '',
+            type,
+            quantity: Number(quantity),
+            availableQuantity: Number(quantity),
+            hrEmail: req.user.email,
+            createdAt: new Date(),
+            updatedAt: new Date()
+        };
+
+        const result = await assetsCollection.insertOne(asset);
+        console.log('Asset created:', result.insertedId);
+
+        res.json({ 
+            success: true, 
+            data: { _id: result.insertedId, ...asset }
+        });
+    } catch (error) {
+        console.error('Asset creation error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/assets', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const assets = await assetsCollection.find().toArray();
+        res.json({ success: true, data: assets });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/assets/:id', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const asset = await assetsCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!asset) {
+            return res.status(404).json({ success: false, error: 'Asset not found' });
+        }
+        res.json({ success: true, data: asset });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.patch('/api/assets/:id', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const assetData = req.body;
+        const updates = {
+            name: assetData.name,
+            image: assetData.image,
+            type: assetData.type,
+            quantity: Number(assetData.quantity),
+            updatedAt: new Date()
+        };
+
+        const result = await assetsCollection.findOneAndUpdate(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates },
+            { returnDocument: 'after' }
+        );
+
+        if (!result.value) {
+            return res.status(404).json({ success: false, error: 'Asset not found' });
+        }
+
+        res.json({ success: true, data: result.value });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.delete('/api/assets/:id', verifyToken, ensureDb, verifyHR, async (req, res) => {
+    try {
+        const result = await assetsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ success: false, error: 'Asset not found' });
+        }
+
+        res.json({ success: true, message: 'Asset deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/requests', verifyToken, ensureDb, verifyHR, async (req, res) => {
+    try {
+        const requests = await requestsCollection.find().toArray();
+        res.json({ success: true, data: requests });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/employees', verifyToken, ensureDb, verifyHR, async (req, res) => {
+    try {
+        const employees = await usersCollection.find({ role: 'Employee' }).toArray();
+        res.json({ success: true, data: employees });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/payments/history', verifyToken, ensureDb, async (req, res) => {
+    try {
+        const payments = await paymentsCollection
+            .find({ userEmail: req.user.email })
+            .sort({ createdAt: -1 })
+            .toArray();
+        res.json({ success: true, data: payments });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.patch('/api/users/make-hr/:email', ensureDb, async (req, res) => {
+    try {
+        const result = await usersCollection.updateOne(
+            { email: req.params.email },
+            { $set: { role: 'HR' } }
+        );
+        res.json({ success: true, message: 'User role updated to HR', result });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
