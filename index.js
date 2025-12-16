@@ -3,6 +3,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { MongoClient, ObjectId, ServerApiVersion } = require('mongodb');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
 const { buildAssetDocument, validateAsset } = require('./src/utils/assetSchema');
@@ -38,13 +39,46 @@ const client = new MongoClient(uri, {
     serverApi: { version: ServerApiVersion.v1 }
 });
 
-let users, assets;
+let users, assets, packages;
 
 (async () => {
     await client.connect();
     const db = client.db('assetVerse');
     users = db.collection('users');
     assets = db.collection('assets');
+    packages = db.collection('packages');
+    
+    // Initialize packages if empty
+    const packageCount = await packages.countDocuments();
+    if (packageCount === 0) {
+        await packages.insertMany([
+            {
+                id: "basic",
+                name: "Basic",
+                price: 5,
+                employeeLimit: 10,
+                features: ["Asset Tracking", "Employee Management", "Basic Support"],
+                createdAt: new Date()
+            },
+            {
+                id: "standard",
+                name: "Standard",
+                price: 8,
+                employeeLimit: 20,
+                features: ["All Basic features", "Advanced Analytics", "Priority Support"],
+                createdAt: new Date()
+            },
+            {
+                id: "premium",
+                name: "Premium",
+                price: 15,
+                employeeLimit: 30,
+                features: ["All Standard features", "Custom Branding", "24/7 Support"],
+                createdAt: new Date()
+            }
+        ]);
+        console.log('Packages initialized');
+    }
     console.log('MongoDB Connected');
 })();
 
@@ -108,6 +142,28 @@ app.get('/api/users', verifyToken, verifyHR, asyncHandler(async (req, res) => {
     res.json(await users.find().toArray());
 }));
 
+app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
+    const user = await users.findOne({ email: req.params.email });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    
+    res.json({ 
+        success: true, 
+        data: {
+            _id: user._id,
+            email: user.email,
+            name: user.name,
+            role: user.role,
+            profileImage: user.profileImage
+        }
+    });
+}));
+
+/* PACKAGES */
+app.get('/api/packages', asyncHandler(async (req, res) => {
+    const allPackages = await packages.find().sort({ price: 1 }).toArray();
+    res.json({ success: true, data: allPackages });
+}));
+
 /* ASSETS */
 app.post('/api/assets', verifyToken, verifyHR, asyncHandler(async (req, res) => {
     const { valid, errors } = validateAsset(req.body);
@@ -123,6 +179,12 @@ app.post('/api/assets', verifyToken, verifyHR, asyncHandler(async (req, res) => 
 
 app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
     res.json(await assets.find().toArray());
+}));
+
+app.get('/api/assets/:id', verifyToken, asyncHandler(async (req, res) => {
+    const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
+    if (!asset) return res.status(404).json({ error: 'Asset not found' });
+    res.json(asset);
 }));
 
 app.patch('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
