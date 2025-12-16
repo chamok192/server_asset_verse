@@ -3,6 +3,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { MongoClient, ObjectId, ServerApiVersion } = require('mongodb');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
 const { buildAssetDocument, validateAsset } = require('./src/utils/assetSchema');
@@ -38,7 +39,7 @@ const client = new MongoClient(uri, {
     serverApi: { version: ServerApiVersion.v1 }
 });
 
-let users, assets, packages;
+let users, assets, packages, payments;
 
 (async () => {
     await client.connect();
@@ -46,6 +47,7 @@ let users, assets, packages;
     users = db.collection('users');
     assets = db.collection('assets');
     packages = db.collection('packages');
+    payments = db.collection('payments');
     
     // Initialize packages if empty
     const packageCount = await packages.countDocuments();
@@ -237,6 +239,147 @@ app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, re
     await assets.deleteOne({ _id: new ObjectId(req.params.id) });
     res.json({ success: true });
 }));
+
+/*  PAYMENTS  */
+app.post('/api/payments/create-intent', verifyToken, asyncHandler(async (req, res) => {
+    const { packageId, amount, email, phoneNumber } = req.body;
+    if (!packageId || !amount || !email || !phoneNumber) {
+        return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+    
+    try {
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: Math.round(amount * 100),
+            currency: 'usd',
+            metadata: {
+                packageId,
+                email,
+                phoneNumber
+            }
+        });
+        
+        const paymentRecord = {
+            paymentIntentId: paymentIntent.id,
+            clientSecret: paymentIntent.client_secret,
+            packageId,
+            amount,
+            email,
+            phoneNumber,
+            status: 'pending',
+            createdAt: new Date(),
+            updatedAt: new Date()
+        };
+        
+        await payments.insertOne(paymentRecord);
+        
+        res.json({ 
+            success: true, 
+            data: { 
+                clientSecret: paymentIntent.client_secret, 
+                paymentIntentId: paymentIntent.id 
+            } 
+        });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+}));
+
+app.post('/api/payments/confirm', verifyToken, asyncHandler(async (req, res) => {
+    const { paymentIntentId, packageId, amount, phoneNumber } = req.body;
+    const userEmail = req.user.email;
+    
+    if (!paymentIntentId || !packageId || !amount) {
+        return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+    
+    try {
+        const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+        
+        if (paymentIntent.status !== 'succeeded') {
+            return res.status(400).json({ success: false, error: 'Payment was not successful' });
+        }
+        
+        const pkg = await packages.findOne({ id: packageId });
+        if (!pkg) {
+            return res.status(404).json({ success: false, error: 'Package not found' });
+        }
+        
+        const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+        
+        const paymentRecord = await payments.findOneAndUpdate(
+            { paymentIntentId },
+            { 
+                $set: { 
+                    status: 'completed',
+                    transactionId: transactionId,
+                    phoneNumber: phoneNumber,
+                    packageName: pkg.name,
+                    paymentDate: new Date(),
+                    updatedAt: new Date()
+                } 
+            },
+            { returnDocument: 'after' }
+        );
+        
+        if (!paymentRecord.value) {
+            return res.status(404).json({ success: false, error: 'Payment record not found' });
+        }
+        
+        let updateResult = null;
+        try {
+            updateResult = await users.findOneAndUpdate(
+                { email: userEmail },
+                { 
+                    $set: { 
+                        subscription: packageId,
+                        packageLimit: pkg.employeeLimit,
+                        subscriptionDate: new Date(),
+                        updatedAt: new Date()
+                    } 
+                },
+                { returnDocument: 'after' }
+            );
+        } catch (err) {
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Payment confirmed and package upgraded',
+            data: {
+                ...(updateResult?.value || {}),
+                transaction: {
+                    transactionId,
+                    amount,
+                    packageName: pkg.name,
+                    status: 'completed'
+                }
+            }
+        });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    }
+}));
+
+app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
+    const userEmail = req.user.email;
+    const paymentHistory = await payments
+        .find({ email: userEmail, status: 'completed' })
+        .sort({ paymentDate: -1 })
+        .toArray();
+    
+    const formatted = paymentHistory.map(payment => ({
+        _id: payment._id,
+        transactionId: payment.transactionId || payment.paymentIntentId,
+        amount: payment.amount,
+        packageName: payment.packageName || payment.packageId,
+        paymentDate: payment.paymentDate || payment.updatedAt,
+        status: 'completed',
+        phoneNumber: payment.phoneNumber
+    }));
+    
+    res.json({ success: true, data: formatted });
+}));
+
 
 /*  ERROR HANDLER */
 app.use((err, req, res, next) => {
