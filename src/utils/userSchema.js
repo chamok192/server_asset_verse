@@ -17,10 +17,10 @@ function buildUserDocument(userData) {
   if (userData.role === 'HR' || userData.role === 'Admin') {
     baseUser.companyName = userData.companyName || '';
     baseUser.companyLogo = userData.companyLogo || '';
-    baseUser.packageLimit = userData.packageLimit || 10;
+    baseUser.packageLimit = userData.packageLimit || 5; // Default 5 employees
     baseUser.currentEmployees = userData.currentEmployees || 0;
-    baseUser.subscription = userData.subscription || 'basic';
-    baseUser.subscriptionDate = userData.subscriptionDate || now;
+    baseUser.subscription = userData.subscription || null; // No package assigned by default
+    baseUser.subscriptionDate = userData.subscriptionDate || null;
   }
 
   return baseUser;

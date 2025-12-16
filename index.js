@@ -3,7 +3,6 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { MongoClient, ObjectId, ServerApiVersion } = require('mongodb');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
 const { buildAssetDocument, validateAsset } = require('./src/utils/assetSchema');
@@ -77,9 +76,18 @@ let users, assets, packages;
                 createdAt: new Date()
             }
         ]);
-        console.log('Packages initialized');
     }
-    console.log('MongoDB Connected');
+
+    // Migration: Update existing HR users to new defaults (5 employee limit, no package)
+    const result = await users.updateMany(
+        { role: 'HR' },
+        { $set: { packageLimit: 5, subscription: null, subscriptionDate: null } }
+    );
+    if (result.modifiedCount > 0) {
+        // Migration complete
+    }
+
+
 })();
 
 /*  ROLE CHECK  */
@@ -123,7 +131,7 @@ app.get('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.patch('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
-    const allowed = ['name', 'phone', 'address', 'profileImage', 'dateOfBirth'];
+    const allowed = ['name', 'phone', 'address', 'profileImage', 'dateOfBirth', 'companyName', 'companyLogo'];
     const updates = Object.fromEntries(
         Object.entries(req.body).filter(([k]) => allowed.includes(k))
     );
@@ -153,7 +161,13 @@ app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
             email: user.email,
             name: user.name,
             role: user.role,
-            profileImage: user.profileImage
+            profileImage: user.profileImage,
+            dateOfBirth: user.dateOfBirth,
+            companyName: user.companyName,
+            companyLogo: user.companyLogo,
+            packageLimit: user.packageLimit,
+            currentEmployees: user.currentEmployees,
+            subscription: user.subscription
         }
     });
 }));
@@ -162,6 +176,22 @@ app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
 app.get('/api/packages', asyncHandler(async (req, res) => {
     const allPackages = await packages.find().sort({ price: 1 }).toArray();
     res.json({ success: true, data: allPackages });
+}));
+
+/* EMPLOYEE LIMIT CHECK */
+app.get('/api/users/limit-check', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    const hr = await users.findOne({ email: req.user.email });
+    const canAdd = hr.currentEmployees < hr.packageLimit;
+    
+    res.json({
+        success: true,
+        data: {
+            currentEmployees: hr.currentEmployees || 0,
+            packageLimit: hr.packageLimit || 5,
+            canAdd: canAdd,
+            message: canAdd ? 'Can add employees' : 'Employee limit reached. Please upgrade package.'
+        }
+    });
 }));
 
 /* ASSETS */
@@ -210,9 +240,8 @@ app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, re
 
 /*  ERROR HANDLER */
 app.use((err, req, res, next) => {
-    console.error(err);
     res.status(500).json({ error: err.message });
 });
 
 /*  START  */
-app.listen(port, () => console.log(`AssetVerse running on port ${port}`));
+app.listen(port, () => {});
