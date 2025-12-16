@@ -289,40 +289,50 @@ app.post('/api/payments/confirm', verifyToken, asyncHandler(async (req, res) => 
     const userEmail = req.user.email;
     
     if (!paymentIntentId || !packageId || !amount) {
-        return res.status(400).json({ success: false, error: 'Missing required fields' });
+        return res.status(400).json({ success: false, error: 'Missing required fields: ' + JSON.stringify({paymentIntentId: !!paymentIntentId, packageId: !!packageId, amount: !!amount}) });
     }
     
     try {
-        const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+        let paymentIntent;
+        try {
+            paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+        } catch (err) {
+            return res.status(400).json({ success: false, error: 'Could not retrieve payment intent from Stripe: ' + err.message });
+        }
         
         if (paymentIntent.status !== 'succeeded') {
-            return res.status(400).json({ success: false, error: 'Payment was not successful' });
+            return res.status(400).json({ success: false, error: `Payment not succeeded. Status: ${paymentIntent.status}` });
         }
         
         const pkg = await packages.findOne({ id: packageId });
         if (!pkg) {
-            return res.status(404).json({ success: false, error: 'Package not found' });
+            return res.status(404).json({ success: false, error: `Package not found with id: ${packageId}` });
         }
         
         const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
         
-        const paymentRecord = await payments.findOneAndUpdate(
-            { paymentIntentId },
-            { 
-                $set: { 
-                    status: 'completed',
-                    transactionId: transactionId,
-                    phoneNumber: phoneNumber,
-                    packageName: pkg.name,
-                    paymentDate: new Date(),
-                    updatedAt: new Date()
-                } 
-            },
-            { returnDocument: 'after' }
-        );
+        let paymentRecord;
+        try {
+            paymentRecord = await payments.findOneAndUpdate(
+                { paymentIntentId },
+                { 
+                    $set: { 
+                        status: 'completed',
+                        transactionId: transactionId,
+                        phoneNumber: phoneNumber,
+                        packageName: pkg.name,
+                        paymentDate: new Date(),
+                        updatedAt: new Date()
+                    } 
+                },
+                { returnDocument: 'after' }
+            );
+        } catch (err) {
+            return res.status(500).json({ success: false, error: 'Database error updating payment: ' + err.message });
+        }
         
-        if (!paymentRecord.value) {
-            return res.status(404).json({ success: false, error: 'Payment record not found' });
+        if (!paymentRecord || !paymentRecord.value) {
+            return res.status(404).json({ success: false, error: 'Payment record not found or could not be updated' });
         }
         
         let updateResult = null;
@@ -356,7 +366,7 @@ app.post('/api/payments/confirm', verifyToken, asyncHandler(async (req, res) => 
             }
         });
     } catch (error) {
-        res.status(400).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, error: 'Unexpected error: ' + error.message });
     }
 }));
 
