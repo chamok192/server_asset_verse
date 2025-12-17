@@ -14,7 +14,7 @@ const port = process.env.PORT || 3000;
 /*  MIDDLEWARE  */
 app.use(express.json());
 app.use(cors({
-    origin: ['http://localhost:5173', 'http://localhost:3000'],
+    origin: ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'],
     credentials: true
 }));
 
@@ -28,6 +28,17 @@ const verifyToken = (req, res, next) => {
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Invalid token' });
         req.user = decoded; // { email, role }
+// ...existing code...
+// Delete a payment transaction by ID
+app.delete('/api/payments/:id', verifyToken, asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const result = await payments.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 1) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+}));
         next();
     });
 };
@@ -241,104 +252,120 @@ app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, re
 }));
 
 /*  PAYMENTS  */
-app.post('/api/payments/create-intent', verifyToken, asyncHandler(async (req, res) => {
-    const { packageId, amount, email, phoneNumber } = req.body;
-    if (!packageId || !amount || !email || !phoneNumber) {
-        return res.status(400).json({ success: false, error: 'Missing required fields' });
-    }
+app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, res) => {
+    const { packageId, email } = req.body;
+    console.log('Creating checkout session:', { packageId, email });
     
+    if (!packageId || !email) {
+        return res.status(400).json({ success: false, error: 'Missing required fields: packageId and email' });
+    }
+
     try {
-        const paymentIntent = await stripe.paymentIntents.create({
-            amount: Math.round(amount * 100),
-            currency: 'usd',
+        const pkg = await packages.findOne({ id: packageId });
+        console.log('Found package:', pkg);
+        if (!pkg) return res.status(404).json({ success: false, error: 'Package not found' });
+
+        // Log the Stripe success_url for debugging
+        console.log('Stripe success_url:', `${process.env.FRONTEND_URL || 'http://localhost:5174'}/hr/payments?payment=success`);
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            line_items: [
+                {
+                    price_data: {
+                        currency: 'usd',
+                        product_data: {
+                            name: pkg.name,
+                            description: `${pkg.employeeLimit} employee limit`
+                        },
+                        unit_amount: Math.round(pkg.price * 100)
+                    },
+                    quantity: 1
+                }
+            ],
+            mode: 'payment',
+            success_url: `${process.env.FRONTEND_URL || 'http://localhost:5174'}/hr/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5174'}/hr/upgrade`,
+            customer_email: email,
+            billing_address_collection: 'auto',
             metadata: {
-                packageId,
-                email,
-                phoneNumber
+                packageId: packageId,
+                email: email,
+                packageName: pkg.name
             }
         });
         
-        const paymentRecord = {
-            paymentIntentId: paymentIntent.id,
-            clientSecret: paymentIntent.client_secret,
-            packageId,
-            amount,
-            email,
-            phoneNumber,
-            status: 'pending',
-            createdAt: new Date(),
-            updatedAt: new Date()
-        };
-        
-        await payments.insertOne(paymentRecord);
-        
+        console.log('Checkout session created:', session.id);
+
         res.json({ 
             success: true, 
             data: { 
-                clientSecret: paymentIntent.client_secret, 
-                paymentIntentId: paymentIntent.id 
+                sessionId: session.id,
+                url: session.url
             } 
         });
     } catch (error) {
+        console.error('Error creating checkout session:', error.message);
         res.status(400).json({ success: false, error: error.message });
     }
 }));
 
-app.post('/api/payments/confirm', verifyToken, asyncHandler(async (req, res) => {
-    const { paymentIntentId, packageId, amount, phoneNumber } = req.body;
-    const userEmail = req.user.email;
-    
-    if (!paymentIntentId || !packageId || !amount) {
-        return res.status(400).json({ success: false, error: 'Missing required fields: ' + JSON.stringify({paymentIntentId: !!paymentIntentId, packageId: !!packageId, amount: !!amount}) });
-    }
-    
+app.post('/api/payments/webhook', express.raw({type: 'application/json'}), asyncHandler(async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+
     try {
-        let paymentIntent;
+        if (!webhookSecret) {
+            console.error('STRIPE_WEBHOOK_SECRET not set in environment variables');
+            // For development: accept webhook without signature verification
+            event = JSON.parse(req.body.toString());
+        } else {
+            event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+        }
+    } catch (error) {
+        console.error('Webhook signature verification failed:', error.message);
+        return res.status(400).json({ error: `Webhook Error: ${error.message}` });
+    }
+
+    console.log('Received webhook event:', event.type);
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        
         try {
-            paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-        } catch (err) {
-            return res.status(400).json({ success: false, error: 'Could not retrieve payment intent from Stripe: ' + err.message });
-        }
-        
-        if (paymentIntent.status !== 'succeeded') {
-            return res.status(400).json({ success: false, error: `Payment not succeeded. Status: ${paymentIntent.status}` });
-        }
-        
-        const pkg = await packages.findOne({ id: packageId });
-        if (!pkg) {
-            return res.status(404).json({ success: false, error: `Package not found with id: ${packageId}` });
-        }
-        
-        const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-        
-        let paymentRecord;
-        try {
-            paymentRecord = await payments.findOneAndUpdate(
-                { paymentIntentId },
-                { 
-                    $set: { 
-                        status: 'completed',
-                        transactionId: transactionId,
-                        phoneNumber: phoneNumber,
-                        packageName: pkg.name,
-                        paymentDate: new Date(),
-                        updatedAt: new Date()
-                    } 
-                },
-                { returnDocument: 'after' }
-            );
-        } catch (err) {
-            return res.status(500).json({ success: false, error: 'Database error updating payment: ' + err.message });
-        }
-        
-        if (!paymentRecord || !paymentRecord.value) {
-            return res.status(404).json({ success: false, error: 'Payment record not found or could not be updated' });
-        }
-        
-        let updateResult = null;
-        try {
-            updateResult = await users.findOneAndUpdate(
-                { email: userEmail },
+            const { packageId, email, packageName } = session.metadata;
+            const pkg = await packages.findOne({ id: packageId });
+            
+            if (!pkg) {
+                console.error('Package not found:', packageId);
+                return res.json({ received: true });
+            }
+
+            const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+
+            console.log('Processing payment for email:', email, 'amount:', session.amount_total / 100);
+
+            // Store payment record
+            const paymentResult = await payments.insertOne({
+                sessionId: session.id,
+                transactionId: transactionId,
+                packageId: packageId,
+                packageName: packageName,
+                amount: session.amount_total / 100,
+                email: email,
+                status: 'completed',
+                paymentDate: new Date(),
+                createdAt: new Date(),
+                updatedAt: new Date()
+            });
+
+            console.log('Payment stored:', paymentResult.insertedId);
+
+            // Update user with new package
+            const userUpdateResult = await users.findOneAndUpdate(
+                { email: email },
                 { 
                     $set: { 
                         subscription: packageId,
@@ -349,33 +376,112 @@ app.post('/api/payments/confirm', verifyToken, asyncHandler(async (req, res) => 
                 },
                 { returnDocument: 'after' }
             );
-        } catch (err) {
+
+            console.log('User updated:', userUpdateResult.value?.email);
+        } catch (error) {
+            console.error('Error processing webhook:', error);
+        }
+    }
+
+    res.json({ received: true });
+}));
+
+app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
+    const { sessionId } = req.params;
+    
+    try {
+        console.log('Checking payment session:', sessionId);
+        
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        console.log('Stripe session status:', session.status, 'payment_status:', session.payment_status);
+        
+        let payment = await payments.findOne({ sessionId: sessionId });
+        console.log('Payment record found:', !!payment);
+        
+        // If payment not in DB yet but Stripe confirms it was paid, manually process it
+        if (!payment && session.payment_status === 'paid' && session.metadata) {
+            const { packageId, email, packageName } = session.metadata;
+            const pkg = await packages.findOne({ id: packageId });
+            
+            if (pkg) {
+                const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+                
+                console.log('Manually processing payment for session:', sessionId);
+                
+                // Store payment record
+                await payments.insertOne({
+                    sessionId: session.id,
+                    transactionId: transactionId,
+                    packageId: packageId,
+                    packageName: packageName,
+                    amount: session.amount_total / 100,
+                    email: email,
+                    status: 'completed',
+                    paymentDate: new Date(),
+                    createdAt: new Date(),
+                    updatedAt: new Date()
+                });
+                
+                // Update user with new package
+                await users.findOneAndUpdate(
+                    { email: email },
+                    { 
+                        $set: { 
+                            subscription: packageId,
+                            packageLimit: pkg.employeeLimit,
+                            subscriptionDate: new Date(),
+                            updatedAt: new Date()
+                        } 
+                    },
+                    { returnDocument: 'after' }
+                );
+                
+                console.log('Payment manually processed and stored');
+                
+                // Fetch the newly created payment
+                payment = await payments.findOne({ sessionId: sessionId });
+            }
         }
         
+        if (!payment) {
+            return res.json({ 
+                success: false,
+                data: {
+                    session: {
+                        status: session.status,
+                        paymentStatus: session.payment_status
+                    },
+                    message: 'Payment is being processed'
+                }
+            });
+        }
+
         res.json({ 
             success: true, 
-            message: 'Payment confirmed and package upgraded',
             data: {
-                ...(updateResult?.value || {}),
-                transaction: {
-                    transactionId,
-                    amount,
-                    packageName: pkg.name,
-                    status: 'completed'
+                payment: payment,
+                session: {
+                    status: session.status,
+                    paymentStatus: session.payment_status
                 }
             }
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: 'Unexpected error: ' + error.message });
+        console.error('Error checking payment session:', error.message);
+        res.status(400).json({ success: false, error: error.message });
     }
 }));
 
 app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
     const userEmail = req.user.email;
+    console.log('Fetching payment history for:', userEmail);
+    
     const paymentHistory = await payments
         .find({ email: userEmail, status: 'completed' })
         .sort({ paymentDate: -1 })
         .toArray();
+    
+    console.log(`Found ${paymentHistory.length} payments for ${userEmail}`);
     
     const formatted = paymentHistory.map(payment => ({
         _id: payment._id,
@@ -384,7 +490,8 @@ app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
         packageName: payment.packageName || payment.packageId,
         paymentDate: payment.paymentDate || payment.updatedAt,
         status: 'completed',
-        phoneNumber: payment.phoneNumber
+        phoneNumber: payment.phoneNumber,
+        email: payment.email
     }));
     
     res.json({ success: true, data: formatted });
