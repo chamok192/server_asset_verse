@@ -91,7 +91,7 @@ app.get('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     // Check if user has completed payments and update subscription if needed
-    if (user.role === 'HR' && user.subscription === 'free') {
+    if (user.role === 'HR') {
         const latestPayment = await payments.findOne({ email: req.user.email, status: 'completed' }, { sort: { paymentDate: -1 } });
         if (latestPayment) {
             const pkg = await packages.findOne({ id: latestPayment.packageId });
@@ -235,9 +235,77 @@ app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, re
 /* EMPLOYEE ASSETS */
 app.get('/api/employee-assets', verifyToken, asyncHandler(async (req, res) => {
     const employeeAssets = await assets.find({ assignedTo: req.user.email }).toArray();
-    res.json({ success: true, data: employeeAssets });
+
+    // Populate with HR company info
+    const populatedAssets = await Promise.all(employeeAssets.map(async (asset) => {
+        const hr = await users.findOne({ email: asset.hrEmail });
+        return {
+            _id: asset._id,
+            assetName: asset.name,
+            assetImage: asset.image,
+            assetType: asset.type,
+            companyName: hr?.companyName || 'Unknown',
+            requestDate: asset.assignedAt || asset.updatedAt, // Assuming assignedAt is set
+            approvalDate: asset.assignedAt || asset.updatedAt,
+            status: 'Approved',
+            canReturn: asset.type === 'returnable'
+        };
+    }));
+
+    res.json({ success: true, data: populatedAssets });
 }));
 
+app.post('/api/employee-assets/:id/return', verifyToken, asyncHandler(async (req, res) => {
+    const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
+    if (!asset) return res.status(404).json({ error: 'Asset not found' });
+    if (asset.assignedTo !== req.user.email) return res.status(403).json({ error: 'Not assigned to you' });
+
+    // Return the asset
+    await assets.updateOne({ _id: new ObjectId(req.params.id) }, { $unset: { assignedTo: 1, assignedAt: 1 }, $inc: { quantity: 1 } });
+
+    // Update HR employee count
+    const hr = await users.findOne({ email: asset.hrEmail });
+    if (hr) {
+        await users.updateOne({ email: asset.hrEmail }, { $inc: { currentEmployees: -1 } });
+    }
+
+    // Check if employee has other assets from this HR
+    const otherAssets = await assets.countDocuments({ assignedTo: req.user.email, hrEmail: asset.hrEmail });
+    if (otherAssets === 0) {
+        // Remove affiliation
+        await users.updateOne({ email: req.user.email }, { $unset: { companyName: 1 } });
+    }
+
+    res.json({ success: true });
+}));
+/* EMPLOYEES */
+app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    const hr = await users.findOne({ email: req.user.email });
+    if (!hr || !hr.companyName) return res.status(400).json({ error: 'HR company not found' });
+
+    const employees = await users.find({ companyName: hr.companyName, role: 'Employee' }).toArray();
+
+    // Add asset count for each employee
+    const employeesWithCounts = await Promise.all(employees.map(async (emp) => {
+        const assetCount = await assets.countDocuments({ assignedTo: emp.email });
+        return { ...emp, assetsCount: assetCount };
+    }));
+
+    res.json({ success: true, data: employeesWithCounts });
+}));
+
+app.delete('/api/employees/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    const hr = await users.findOne({ email: req.user.email });
+    if (!hr || !hr.companyName) return res.status(400).json({ error: 'HR company not found' });
+
+    const employee = await users.findOne({ _id: new ObjectId(req.params.id), companyName: hr.companyName });
+    if (!employee) return res.status(404).json({ error: 'Employee not found' });
+
+    await users.updateOne({ _id: new ObjectId(req.params.id) }, { $unset: { companyName: 1 } });
+    await users.updateOne({ email: req.user.email }, { $inc: { currentEmployees: -1 } });
+
+    res.json({ success: true });
+}));
 /* REQUESTS */
 app.post('/api/requests', verifyToken, asyncHandler(async (req, res) => {
     const { assetId, note, status, employeeEmail } = req.body;
@@ -265,7 +333,7 @@ app.post('/api/requests', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/requests', verifyToken, verifyHR, asyncHandler(async (req, res) => {
-    const hrRequests = await requests.find({ hrEmail: req.user.email }).toArray();
+    const hrRequests = await requests.find({ hrEmail: req.user.email, status: 'pending' }).toArray();
 
     // Populate employee and asset data
     const populatedRequests = await Promise.all(hrRequests.map(async (req) => {
@@ -300,9 +368,15 @@ app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, r
     await requests.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
 
     if (status === 'accepted') {
+        // Check asset availability
+        const asset = await assets.findOne({ _id: new ObjectId(request.assetId) });
+        if (!asset || asset.quantity <= 0) {
+            return res.status(400).json({ error: 'Asset not available or out of stock' });
+        }
+
         // Assign asset to employee
         try {
-            await assets.updateOne({ _id: new ObjectId(request.assetId) }, { $set: { assignedTo: request.employeeEmail } });
+            await assets.updateOne({ _id: new ObjectId(request.assetId) }, { $set: { assignedTo: request.employeeEmail, assignedAt: new Date() }, $inc: { quantity: -1 } });
         } catch (e) {
             return res.status(400).json({ error: 'Invalid asset ID in request' });
         }
