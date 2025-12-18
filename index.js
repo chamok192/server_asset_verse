@@ -28,15 +28,6 @@ const verifyToken = (req, res, next) => {
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Invalid token' });
         req.user = decoded;
-app.delete('/api/payments/:id', verifyToken, asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const result = await payments.deleteOne({ _id: new ObjectId(id) });
-    if (result.deletedCount === 1) {
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ success: false, error: 'Payment not found' });
-    }
-}));
         next();
     });
 };
@@ -130,9 +121,9 @@ app.get('/api/users', verifyToken, asyncHandler(async (req, res) => {
 app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
     const user = await users.findOne({ email: req.params.email });
     if (!user) return res.status(404).json({ error: 'User not found' });
-    
-    res.json({ 
-        success: true, 
+
+    res.json({
+        success: true,
         data: {
             _id: user._id,
             email: user.email,
@@ -142,6 +133,7 @@ app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
             dateOfBirth: user.dateOfBirth,
             companyName: user.companyName,
             companyLogo: user.companyLogo,
+            companies: user.companies || [],
             packageLimit: user.packageLimit,
             currentEmployees: user.currentEmployees,
             subscription: user.subscription
@@ -159,7 +151,7 @@ app.get('/api/packages', asyncHandler(async (req, res) => {
 app.get('/api/users/limit-check', verifyToken, verifyHR, asyncHandler(async (req, res) => {
     const hr = await users.findOne({ email: req.user.email });
     const canAdd = hr.currentEmployees < hr.packageLimit;
-    
+
     res.json({
         success: true,
         data: {
@@ -189,7 +181,39 @@ app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
     if (req.user.role === 'HR') {
         query.hrEmail = req.user.email;
     }
-    res.json(await assets.find(query).toArray());
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    if (req.query.noPagination === 'true') {
+        const result = await assets.find(query).toArray();
+        return res.json(result);
+    }
+
+    // Add filtering
+    if (req.query.search) {
+        query.name = { $regex: req.query.search, $options: 'i' };
+    }
+    if (req.query.filter && req.query.filter !== 'all') {
+        query.type = req.query.filter;
+    }
+    if (req.query.quantity === 'available') { // For request asset grid
+        query.quantity = { $gt: 0 };
+    }
+
+    const total = await assets.countDocuments(query);
+    const result = await assets.find(query)
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+
+    res.json({
+        data: result,
+        currentPage: page,
+        totalPages: Math.ceil(total / limit),
+        totalAssets: total
+    });
 }));
 
 app.get('/api/assets/:id', verifyToken, asyncHandler(async (req, res) => {
@@ -273,7 +297,7 @@ app.post('/api/employee-assets/:id/return', verifyToken, asyncHandler(async (req
     const otherAssets = await assets.countDocuments({ assignedTo: req.user.email, hrEmail: asset.hrEmail });
     if (otherAssets === 0) {
         // Remove affiliation
-        await users.updateOne({ email: req.user.email }, { $unset: { companyName: 1 } });
+        await users.updateOne({ email: req.user.email }, { $pull: { companies: { hrEmail: asset.hrEmail } } });
     }
 
     res.json({ success: true });
@@ -283,7 +307,17 @@ app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) =
     const hr = await users.findOne({ email: req.user.email });
     if (!hr || !hr.companyName) return res.status(400).json({ error: 'HR company not found' });
 
-    const employees = await users.find({ companyName: hr.companyName, role: 'Employee' }).toArray();
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const query = { companies: { $elemMatch: { companyName: hr.companyName } }, role: 'Employee' };
+
+    const total = await users.countDocuments(query);
+    const employees = await users.find(query)
+        .skip(skip)
+        .limit(limit)
+        .toArray();
 
     // Add asset count for each employee
     const employeesWithCounts = await Promise.all(employees.map(async (emp) => {
@@ -291,17 +325,23 @@ app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) =
         return { ...emp, assetsCount: assetCount };
     }));
 
-    res.json({ success: true, data: employeesWithCounts });
+    res.json({
+        success: true,
+        data: employeesWithCounts,
+        currentPage: page,
+        totalPages: Math.ceil(total / limit),
+        totalEmployees: total
+    });
 }));
 
 app.delete('/api/employees/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
     const hr = await users.findOne({ email: req.user.email });
     if (!hr || !hr.companyName) return res.status(400).json({ error: 'HR company not found' });
 
-    const employee = await users.findOne({ _id: new ObjectId(req.params.id), companyName: hr.companyName });
+    const employee = await users.findOne({ _id: new ObjectId(req.params.id), companies: { $elemMatch: { companyName: hr.companyName } } });
     if (!employee) return res.status(404).json({ error: 'Employee not found' });
 
-    await users.updateOne({ _id: new ObjectId(req.params.id) }, { $unset: { companyName: 1 } });
+    await users.updateOne({ _id: new ObjectId(req.params.id) }, { $pull: { companies: { companyName: hr.companyName } } });
     await users.updateOne({ email: req.user.email }, { $inc: { currentEmployees: -1 } });
 
     res.json({ success: true });
@@ -384,7 +424,7 @@ app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, r
         // Affiliate employee with company
         const hr = await users.findOne({ email: request.hrEmail });
         if (hr && hr.companyName) {
-            await users.updateOne({ email: request.employeeEmail }, { $set: { companyName: hr.companyName } });
+            await users.updateOne({ email: request.employeeEmail }, { $addToSet: { companies: { companyName: hr.companyName, hrEmail: request.hrEmail, joinedAt: new Date() } } });
             await users.updateOne({ email: request.hrEmail }, { $inc: { currentEmployees: 1 } });
         }
     }
@@ -396,7 +436,7 @@ app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, r
 app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, res) => {
     const { packageId, email } = req.body;
     console.log('Creating checkout session:', { packageId, email });
-    
+
     if (!packageId || !email) {
         return res.status(400).json({ success: false, error: 'Missing required fields: packageId and email' });
     }
@@ -435,15 +475,15 @@ app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, 
                 packageName: pkg.name
             }
         });
-        
+
         console.log('Checkout session created:', session.id);
 
-        res.json({ 
-            success: true, 
-            data: { 
+        res.json({
+            success: true,
+            data: {
                 sessionId: session.id,
                 url: session.url
-            } 
+            }
         });
     } catch (error) {
         console.error('Error creating checkout session:', error.message);
@@ -451,7 +491,7 @@ app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, 
     }
 }));
 
-app.post('/api/payments/webhook', express.raw({type: 'application/json'}), asyncHandler(async (req, res) => {
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
     const sig = req.headers['stripe-signature'];
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -474,11 +514,11 @@ app.post('/api/payments/webhook', express.raw({type: 'application/json'}), async
 
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        
+
         try {
             const { packageId, email, packageName } = session.metadata;
             const pkg = await packages.findOne({ id: packageId });
-            
+
             if (!pkg) {
                 console.error('Package not found:', packageId);
                 return res.json({ received: true });
@@ -507,13 +547,13 @@ app.post('/api/payments/webhook', express.raw({type: 'application/json'}), async
             // Update user with new package
             const userUpdateResult = await users.findOneAndUpdate(
                 { email: email },
-                { 
-                    $set: { 
+                {
+                    $set: {
                         subscription: packageId,
                         packageLimit: pkg.employeeLimit,
                         subscriptionDate: new Date(),
                         updatedAt: new Date()
-                    } 
+                    }
                 },
                 { returnDocument: 'after' }
             );
@@ -529,26 +569,26 @@ app.post('/api/payments/webhook', express.raw({type: 'application/json'}), async
 
 app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
     const { sessionId } = req.params;
-    
+
     try {
         console.log('Checking payment session:', sessionId);
-        
+
         const session = await stripe.checkout.sessions.retrieve(sessionId);
         console.log('Stripe session status:', session.status, 'payment_status:', session.payment_status);
-        
+
         let payment = await payments.findOne({ sessionId: sessionId });
         console.log('Payment record found:', !!payment);
-        
+
         // If payment not in DB yet but Stripe confirms it was paid, manually process it
         if (!payment && session.payment_status === 'paid' && session.metadata) {
             const { packageId, email, packageName } = session.metadata;
             const pkg = await packages.findOne({ id: packageId });
-            
+
             if (pkg) {
                 const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-                
+
                 console.log('Manually processing payment for session:', sessionId);
-                
+
                 // Store payment record
                 await payments.insertOne({
                     sessionId: session.id,
@@ -562,30 +602,30 @@ app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
                     createdAt: new Date(),
                     updatedAt: new Date()
                 });
-                
+
                 // Update user with new package
                 await users.findOneAndUpdate(
                     { email: email },
-                    { 
-                        $set: { 
+                    {
+                        $set: {
                             subscription: packageId,
                             packageLimit: pkg.employeeLimit,
                             subscriptionDate: new Date(),
                             updatedAt: new Date()
-                        } 
+                        }
                     },
                     { returnDocument: 'after' }
                 );
-                
+
                 console.log('Payment manually processed and stored');
-                
+
                 // Fetch the newly created payment
                 payment = await payments.findOne({ sessionId: sessionId });
             }
         }
-        
+
         if (!payment) {
-            return res.json({ 
+            return res.json({
                 success: false,
                 data: {
                     session: {
@@ -597,8 +637,8 @@ app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
             });
         }
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             data: {
                 payment: payment,
                 session: {
@@ -616,14 +656,14 @@ app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
 app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
     const userEmail = req.user.email;
     console.log('Fetching payment history for:', userEmail);
-    
+
     const paymentHistory = await payments
         .find({ email: userEmail, status: 'completed' })
         .sort({ paymentDate: -1 })
         .toArray();
-    
+
     console.log(`Found ${paymentHistory.length} payments for ${userEmail}`);
-    
+
     const formatted = paymentHistory.map(payment => ({
         _id: payment._id,
         transactionId: payment.transactionId || payment.paymentIntentId,
@@ -634,9 +674,20 @@ app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
         phoneNumber: payment.phoneNumber,
         email: payment.email
     }));
-    
+
     res.json({ success: true, data: formatted });
 }));
+
+app.delete('/api/payments/:id', verifyToken, asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const result = await payments.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 1) {
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+}));
+
 
 
 /*  ERROR HANDLER */
@@ -653,7 +704,7 @@ app.use((err, req, res, next) => {
     packages = db.collection('packages');
     payments = db.collection('payments');
     requests = db.collection('requests');
-    
+
     // Initialize packages if empty
     const packageCount = await packages.countDocuments();
     if (packageCount === 0) {
@@ -693,14 +744,14 @@ app.use((err, req, res, next) => {
         ]);
     }
 
-    // Migration: Update existing HR users to new defaults (5 employee limit, free plan)
+    // Migration: Update existing HR users to new defaults (5 employee limit, free plan) ONLY if not present
     const result = await users.updateMany(
-        { role: 'HR' },
+        { role: 'HR', subscription: { $exists: false } },
         { $set: { packageLimit: 5, subscription: 'free', subscriptionDate: new Date(), updatedAt: new Date() } }
     );
     if (result.modifiedCount > 0) {
-        // Migration complete
+        console.log(`Migrated ${result.modifiedCount} users to default subscription.`);
     }
 
-    app.listen(port, () => {});
+    app.listen(port, () => { });
 })();

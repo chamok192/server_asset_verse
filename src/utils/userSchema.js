@@ -21,6 +21,8 @@ function buildUserDocument(userData) {
     baseUser.currentEmployees = userData.currentEmployees || 0;
     baseUser.subscription = userData.subscription || null; // No package assigned by default
     baseUser.subscriptionDate = userData.subscriptionDate || null;
+  } else if (userData.role === 'Employee') {
+    baseUser.companies = userData.companies || []; // Array of {companyName, hrEmail, joinedAt}
   }
 
   return baseUser;
