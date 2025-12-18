@@ -186,11 +186,6 @@ app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
 
-    if (req.query.noPagination === 'true') {
-        const result = await assets.find(query).toArray();
-        return res.json(result);
-    }
-
     // Add filtering
     if (req.query.search) {
         query.name = { $regex: req.query.search, $options: 'i' };
@@ -202,17 +197,50 @@ app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
         query.quantity = { $gt: 0 };
     }
 
+    if (req.query.noPagination === 'true') {
+        const result = await assets.find(query).toArray();
+        return res.json(result);
+    }
+
     const total = await assets.countDocuments(query);
+
+    // Calculate stats using aggregation
+    const statsPipeline = [
+        { $match: query },
+        {
+            $group: {
+                _id: null,
+                totalQuantity: { $sum: { $toInt: "$quantity" } }, // Ensure quantity is treated as number
+                availableCount: {
+                    $sum: {
+                        $cond: [{ $gt: [{ $toInt: "$quantity" }, 0] }, 1, 0]
+                    }
+                },
+                lowStock: {
+                    $sum: {
+                        $cond: [{ $lte: [{ $toInt: "$quantity" }, 5] }, 1, 0]
+                    }
+                }
+            }
+        }
+    ];
+    const statsResult = await assets.aggregate(statsPipeline).toArray();
+    const stats = statsResult.length > 0 ? statsResult[0] : { totalQuantity: 0, availableCount: 0, lowStock: 0 };
+
     const result = await assets.find(query)
         .skip(skip)
         .limit(limit)
+        .sort({ createdAt: -1 })
         .toArray();
 
     res.json({
         data: result,
         currentPage: page,
         totalPages: Math.ceil(total / limit),
-        totalAssets: total
+        totalAssets: total,
+        totalQuantity: stats.totalQuantity,
+        availableCount: stats.availableCount || 0,
+        lowStock: stats.lowStock
     });
 }));
 
@@ -319,7 +347,6 @@ app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) =
         .limit(limit)
         .toArray();
 
-    // Add asset count for each employee
     const employeesWithCounts = await Promise.all(employees.map(async (emp) => {
         const assetCount = await assets.countDocuments({ assignedTo: emp.email });
         return { ...emp, assetsCount: assetCount };
@@ -346,6 +373,25 @@ app.delete('/api/employees/:id', verifyToken, verifyHR, asyncHandler(async (req,
 
     res.json({ success: true });
 }));
+app.get('/api/my-team', verifyToken, asyncHandler(async (req, res) => {
+    const user = await users.findOne({ email: req.user.email });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (!user.companies || !Array.isArray(user.companies) || user.companies.length === 0) {
+        return res.json({ success: true, data: [] });
+    }
+
+    const companyNames = user.companies.map(c => c.companyName);
+
+    const teamMembers = await users.find({
+        role: 'Employee',
+        email: { $ne: req.user.email },
+        companies: { $elemMatch: { companyName: { $in: companyNames } } }
+    }).toArray();
+
+    res.json({ success: true, data: teamMembers });
+}));
+
 /* REQUESTS */
 app.post('/api/requests', verifyToken, asyncHandler(async (req, res) => {
     const { assetId, note, status, employeeEmail } = req.body;
