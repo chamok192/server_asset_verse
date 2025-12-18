@@ -93,6 +93,16 @@ app.get('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
                 user.subscriptionDate = latestPayment.paymentDate;
             }
         }
+
+
+        const actualCount = await users.countDocuments({
+            role: 'Employee',
+            'companies.hrEmail': user.email
+        });
+        if (user.currentEmployees !== actualCount) {
+            await users.updateOne({ email: user.email }, { $set: { currentEmployees: actualCount } });
+            user.currentEmployees = actualCount;
+        }
     }
 
     res.json(user);
@@ -150,6 +160,19 @@ app.get('/api/packages', asyncHandler(async (req, res) => {
 /* EMPLOYEE LIMIT CHECK */
 app.get('/api/users/limit-check', verifyToken, verifyHR, asyncHandler(async (req, res) => {
     const hr = await users.findOne({ email: req.user.email });
+    if (!hr) return res.status(404).json({ error: 'HR not found' });
+
+
+    const actualCount = await users.countDocuments({
+        role: 'Employee',
+        companies: { $elemMatch: { hrEmail: req.user.email } }
+    });
+
+    if (hr.currentEmployees !== actualCount) {
+        await users.updateOne({ email: req.user.email }, { $set: { currentEmployees: actualCount } });
+        hr.currentEmployees = actualCount;
+    }
+
     const canAdd = hr.currentEmployees < hr.packageLimit;
 
     res.json({
@@ -244,6 +267,56 @@ app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
     });
 }));
 
+app.get('/api/hr/analytics', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    const hrEmail = req.user.email;
+
+    // 1. Distribution by Type (Pie Chart)
+    const typeDistribution = await assets.aggregate([
+        { $match: { hrEmail } },
+        { $group: { _id: "$type", count: { $sum: 1 } } },
+        { $project: { name: "$_id", value: "$count", _id: 0 } }
+    ]).toArray();
+
+    // 2. Top 5 Requested Assets (Bar Chart)
+    const topRequests = await requests.aggregate([
+        { $match: { hrEmail } },
+        { $group: { _id: "$assetId", requestCount: { $sum: 1 } } },
+        { $sort: { requestCount: -1 } },
+        { $limit: 5 },
+        {
+            $addFields: {
+                assetObjectId: {
+                    $convert: { input: "$_id", to: "objectId", onError: null, onNull: null }
+                }
+            }
+        },
+        {
+            $lookup: {
+                from: "assets",
+                localField: "assetObjectId",
+                foreignField: "_id",
+                as: "assetInfo"
+            }
+        },
+        { $unwind: "$assetInfo" },
+        {
+            $project: {
+                name: "$assetInfo.name",
+                count: "$requestCount",
+                _id: 0
+            }
+        }
+    ]).toArray();
+
+    res.json({
+        success: true,
+        data: {
+            typeDistribution,
+            topRequests
+        }
+    });
+}));
+
 app.get('/api/assets/:id', verifyToken, asyncHandler(async (req, res) => {
     const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
     if (!asset) return res.status(404).json({ error: 'Asset not found' });
@@ -314,12 +387,6 @@ app.post('/api/employee-assets/:id/return', verifyToken, asyncHandler(async (req
 
     // Return the asset
     await assets.updateOne({ _id: new ObjectId(req.params.id) }, { $unset: { assignedTo: 1, assignedAt: 1 }, $inc: { quantity: 1 } });
-
-    // Update HR employee count
-    const hr = await users.findOne({ email: asset.hrEmail });
-    if (hr) {
-        await users.updateOne({ email: asset.hrEmail }, { $inc: { currentEmployees: -1 } });
-    }
 
     // Check if employee has other assets from this HR
     const otherAssets = await assets.countDocuments({ assignedTo: req.user.email, hrEmail: asset.hrEmail });
@@ -467,11 +534,48 @@ app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, r
             return res.status(400).json({ error: 'Invalid asset ID in request' });
         }
 
-        // Affiliate employee with company
+        // Affiliate employee with company if not already affiliated
         const hr = await users.findOne({ email: request.hrEmail });
         if (hr && hr.companyName) {
-            await users.updateOne({ email: request.employeeEmail }, { $addToSet: { companies: { companyName: hr.companyName, hrEmail: request.hrEmail, joinedAt: new Date() } } });
-            await users.updateOne({ email: request.hrEmail }, { $inc: { currentEmployees: 1 } });
+
+            const isAffiliated = await users.findOne({
+                email: request.employeeEmail,
+                'companies.hrEmail': request.hrEmail
+            });
+
+            if (!isAffiliated) {
+
+                const actualCount = await users.countDocuments({
+                    role: 'Employee',
+                    'companies.hrEmail': request.hrEmail
+                });
+
+                if (actualCount >= (hr.packageLimit || 5)) {
+
+                    await requests.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: 'pending' } });
+
+                    await assets.updateOne({ _id: new ObjectId(request.assetId) }, { $inc: { quantity: 1 }, $unset: { assignedTo: 1, assignedAt: 1 } });
+
+
+                    await users.updateOne({ email: request.hrEmail }, { $set: { currentEmployees: actualCount } });
+
+                    return res.status(403).json({ error: 'Employee limit reached. Please upgrade your plan.' });
+                }
+
+                const result = await users.updateOne(
+                    { email: request.employeeEmail },
+                    { $addToSet: { companies: { companyName: hr.companyName, hrEmail: request.hrEmail, joinedAt: new Date() } } }
+                );
+
+                if (result.modifiedCount > 0) {
+
+                    const actualCount = await users.countDocuments({
+                        role: 'Employee',
+                        'companies.hrEmail': request.hrEmail
+                    });
+                    await users.updateOne({ email: request.hrEmail }, { $set: { currentEmployees: actualCount } });
+                }
+            }
         }
     }
 
@@ -492,7 +596,7 @@ app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, 
         console.log('Found package:', pkg);
         if (!pkg) return res.status(404).json({ success: false, error: 'Package not found' });
 
-        // Log the Stripe success_url for debugging
+
         console.log('Stripe success_url:', `${process.env.FRONTEND_URL || 'http://localhost:5174'}/hr/payments?payment=success`);
 
         const session = await stripe.checkout.sessions.create({
