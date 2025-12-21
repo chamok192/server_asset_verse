@@ -4,9 +4,17 @@ const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const { MongoClient, ObjectId, ServerApiVersion } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const admin = require('firebase-admin');
 const fs = require('fs');
 const { buildAssetDocument, validateAsset } = require('./src/utils/assetSchema');
 const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
+
+// Firebase Admin SDK initialization
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
+const serviceAccount = JSON.parse(decoded);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -1053,5 +1061,5 @@ app.use((err, req, res, next) => {
         } catch (e) { }
     }
 
-    app.listen(port, () => { });
+    // app.listen(port, () => { });
 })();
