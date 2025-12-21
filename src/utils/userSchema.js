@@ -1,45 +1,50 @@
 function buildUserDocument(userData) {
-  const now = new Date();
-  
-  const baseUser = {
-    name: userData.name || '',
-    email: userData.email,
-    uid: userData.uid,
-    role: userData.role || 'Employee',
-    dateOfBirth: userData.dateOfBirth || null,
-    profileImage: userData.profileImage || '',
-    phone: userData.phone || '',
-    address: userData.address || '',
-    createdAt: userData.createdAt || now,
-    updatedAt: now
-  };
+    const now = new Date();
+    const role = userData.role || 'Employee';
 
-  if (userData.role === 'HR' || userData.role === 'Admin') {
-    baseUser.companyName = userData.companyName || '';
-    baseUser.companyLogo = userData.companyLogo || '';
-    baseUser.packageLimit = userData.packageLimit || 5; // Default 5 employees
-    baseUser.currentEmployees = userData.currentEmployees || 0;
-    baseUser.subscription = userData.subscription || null; // No package assigned by default
-    baseUser.subscriptionDate = userData.subscriptionDate || null;
-  } else if (userData.role === 'Employee') {
-    baseUser.companies = userData.companies || []; // Array of {companyName, hrEmail, joinedAt}
-  }
+    const baseUser = {
+        uid: userData.uid,
+        email: userData.email,
+        name: userData.name,
+        profileImage: userData.profileImage || '',
+        dateOfBirth: userData.dateOfBirth || '',
+        role: role,
+        createdAt: userData.createdAt || now,
+        updatedAt: now
+    };
 
-  return baseUser;
+    if (role === 'HR') {
+        const subscription = userData.subscription || 'free';
+        const packageLimit = subscription === 'free' ? 3 : (Number(userData.packageLimit) || 3);
+
+        return {
+            ...baseUser,
+            companyName: userData.companyName || '',
+            companyLogo: userData.companyLogo || '',
+            packageLimit: packageLimit,
+            currentEmployees: Number(userData.currentEmployees) || 0,
+            subscription: subscription,
+            subscriptionDate: userData.subscriptionDate || now
+        };
+    }
+
+    return baseUser;
 }
 
 function validateUser(userData) {
-  const errors = [];
+    const errors = [];
+    if (!userData.email) errors.push('Email is required');
+    if (!userData.name) errors.push('Name is required');
+    if (!userData.role) errors.push('Role is required');
+    if (!userData.uid) errors.push('UID is required');
 
-  if (!userData.email) errors.push('Email is required');
-  if (!userData.uid) errors.push('UID is required');
-
-  const validRoles = ['Employee', 'HR', 'Admin'];
-  if (userData.role && !validRoles.includes(userData.role)) {
-    errors.push(`Role must be one of: ${validRoles.join(', ')}`);
-  }
-
-  return { valid: errors.length === 0, errors };
+    return {
+        valid: errors.length === 0,
+        errors
+    };
 }
 
-module.exports = { buildUserDocument, validateUser };
+module.exports = {
+    buildUserDocument,
+    validateUser
+};
