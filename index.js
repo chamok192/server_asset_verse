@@ -12,25 +12,104 @@ const { buildUserDocument, validateUser } = require('./src/utils/userSchema');
 // Firebase Admin SDK initialization
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, 'base64').toString('utf8');
 const serviceAccount = JSON.parse(decoded);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
 
 const app = express();
-const port = process.env.PORT || 3000;
+
+// ---------- ASYNC HANDLER ----------
+const asyncHandler = fn => (req, res, next) =>
+    Promise.resolve(fn(req, res)).catch(next);
+
+// ---------- MONGODB ----------
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.gtbyi48.mongodb.net/?appName=Cluster0`;
+
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+let users, assets, packages, payments, requests, employeeAffiliations, assignedAssets;
+
+async function connectDB() {
+  if (users) return;
+
+  try {
+    await client.connect();
+    const db = client.db("assetverse");
+    users = db.collection("users");
+    assets = db.collection("assets");
+    packages = db.collection("packages");
+    payments = db.collection("payments");
+    requests = db.collection("requests");
+    employeeAffiliations = db.collection("employeeAffiliations");
+    assignedAssets = db.collection("assignedAssets");
+    console.log("✅ MongoDB connected");
+  } catch (err) {
+    console.error("❌ MongoDB connection failed", err);
+    throw err;
+  }
+}
+
+// ---------- STRIPE WEBHOOK (ISOLATED) ----------
+app.post(
+  '/api/payments/webhook',
+  express.raw({ type: 'application/json' }),
+  asyncHandler(async (req, res) => {
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const sig = req.headers['stripe-signature'];
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+      console.error('Webhook signature verification failed.', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the event
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+        const paymentIntent = event.data.object;
+        // Update payment status in DB
+        await connectDB();
+        await payments.updateOne(
+          { paymentIntentId: paymentIntent.id },
+          { $set: { status: 'completed', updatedAt: new Date() } }
+        );
+        console.log('Payment succeeded:', paymentIntent.id);
+        break;
+      // Add other event types if needed
+      default:
+        console.log(`Unhandled event type ${event.type}`);
+    }
+
+    res.json({ received: true });
+  })
+);
+
+// ---------- MIDDLEWARE ----------
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "https://assetverse-2121.web.app",
+    "https://assetverse-2121.firebaseapp.com"
+  ],
+  credentials: true
+}));
 
 app.use(express.json());
-app.use(cors({
-    origin: process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',') : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000'],
-    credentials: true
-}));
 
 app.get('/', (req, res) => {
     res.send('AssetVerse Server is running!');
 });
-
-const asyncHandler = fn => (req, res, next) =>
-    Promise.resolve(fn(req, res)).catch(next);
 
 const verifyToken = (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
@@ -43,29 +122,6 @@ const verifyToken = (req, res, next) => {
     });
 };
 
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.gtbyi48.mongodb.net/?appName=Cluster0`;
-
-const client = new MongoClient(uri, {
-    serverApi: { version: ServerApiVersion.v1 }
-});
-
-let users, assets, packages, payments, requests, employeeAffiliations, assignedAssets;
-
-const getCollections = async () => {
-    if (!users) {
-        await client.connect();
-        const db = client.db('assetVerse');
-        users = db.collection('users');
-        assets = db.collection('assets');
-        packages = db.collection('packages');
-        payments = db.collection('payments');
-        requests = db.collection('requests');
-        employeeAffiliations = db.collection('employeeAffiliations');
-        assignedAssets = db.collection('assignedAssets');
-    }
-    return { users, assets, packages, payments, requests, employeeAffiliations, assignedAssets };
-};
-
 const verifyHR = (req, res, next) => {
     const role = req.user.role?.toLowerCase();
     if (!['hr', 'admin'].includes(role)) {
@@ -75,6 +131,7 @@ const verifyHR = (req, res, next) => {
 };
 
 app.post('/api/auth/login', asyncHandler(async (req, res) => {
+    await connectDB();
     const user = await users.findOne({ email: req.body.email });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -88,6 +145,7 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/users', asyncHandler(async (req, res) => {
+    await connectDB();
     const { valid, errors } = validateUser(req.body);
     if (!valid) return res.status(400).json({ errors });
 
@@ -101,6 +159,7 @@ app.post('/api/users', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const user = await users.findOne({ email: req.user.email });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -146,10 +205,12 @@ app.patch('/api/users/profile', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/users', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     res.json(await users.find().toArray());
 }));
 
 app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
+    await connectDB();
     const user = await users.findOne({ email: req.params.email });
     if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -176,6 +237,7 @@ app.get('/api/users/email/:email', asyncHandler(async (req, res) => {
 
 app.get('/api/packages', async (req, res) => {
     try {
+        await connectDB();
         const allPackages = await packages.find().sort({ price: 1 }).toArray();
         res.json({ success: true, data: allPackages });
     } catch (e) {
@@ -185,6 +247,7 @@ app.get('/api/packages', async (req, res) => {
 
 /* EMPLOYEE LIMIT CHECK */
 app.get('/api/users/limit-check', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const hr = await users.findOne({ email: req.user.email });
     if (!hr) return res.status(404).json({ error: 'HR not found' });
 
@@ -210,6 +273,7 @@ app.get('/api/users/limit-check', verifyToken, verifyHR, asyncHandler(async (req
 }));
 
 app.post('/api/assets', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const { valid, errors } = validateAsset(req.body);
     if (!valid) return res.status(400).json({ errors });
 
@@ -225,6 +289,7 @@ app.post('/api/assets', verifyToken, verifyHR, asyncHandler(async (req, res) => 
 }));
 
 app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     let query = {};
     const role = req.user.role?.toLowerCase();
     if (role === 'hr') {
@@ -296,6 +361,7 @@ app.get('/api/assets', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/hr/analytics', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const hrEmail = req.user.email;
 
     // Type distribution
@@ -363,6 +429,7 @@ app.get('/api/hr/analytics', verifyToken, verifyHR, asyncHandler(async (req, res
 }));
 
 app.get('/api/assets/:id', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
     if (!asset) return res.status(404).json({ error: 'Asset not found' });
     if (req.user.role === 'HR' && asset.hrEmail !== req.user.email) {
@@ -372,6 +439,7 @@ app.get('/api/assets/:id', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.patch('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
     if (!asset) return res.status(404).json({ error: 'Asset not found' });
     if (asset.hrEmail !== req.user.email) {
@@ -393,6 +461,7 @@ app.patch('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, res
 }));
 
 app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const asset = await assets.findOne({ _id: new ObjectId(req.params.id) });
     if (!asset) return res.status(404).json({ error: 'Asset not found' });
     if (asset.hrEmail !== req.user.email) {
@@ -403,6 +472,7 @@ app.delete('/api/assets/:id', verifyToken, verifyHR, asyncHandler(async (req, re
 }));
 
 app.get('/api/employee-assets', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const query = { employeeEmail: req.user.email };
     if (req.query.search) {
         query.assetName = { $regex: req.query.search, $options: 'i' };
@@ -436,6 +506,7 @@ app.get('/api/employee-assets', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/employee-assets/:id/return', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const assignedAssetId = req.params.id;
     const assignment = await assignedAssets.findOne({ _id: new ObjectId(assignedAssetId) });
 
@@ -461,6 +532,7 @@ app.post('/api/employee-assets/:id/return', verifyToken, asyncHandler(async (req
     res.json({ success: true });
 }));
 app.delete('/api/employee-assets/:id', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const assignedAssetId = req.params.id;
     const assignment = await assignedAssets.findOne({ _id: new ObjectId(assignedAssetId) });
 
@@ -477,6 +549,7 @@ app.delete('/api/employee-assets/:id', verifyToken, asyncHandler(async (req, res
     res.json({ success: true });
 }));
 app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const hrEmail = req.user.email;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
@@ -513,6 +586,7 @@ app.get('/api/employees', verifyToken, verifyHR, asyncHandler(async (req, res) =
 }));
 
 app.delete('/api/employees/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const hrEmail = req.user.email;
     const affiliationId = req.params.id;
 
@@ -555,6 +629,7 @@ app.get('/api/my-team', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/requests', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const { assetId, note, status, employeeEmail } = req.body;
     if (!assetId || !employeeEmail) return res.status(400).json({ error: 'Missing required fields' });
 
@@ -580,6 +655,7 @@ app.post('/api/requests', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/requests', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const hrEmail = req.user.email;
     const hrRequests = await requests.find({
         $or: [
@@ -617,6 +693,7 @@ app.get('/api/requests', verifyToken, verifyHR, asyncHandler(async (req, res) =>
 }));
 
 app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const { status } = req.body;
     let request;
     try {
@@ -700,6 +777,7 @@ app.patch('/api/requests/:id', verifyToken, verifyHR, asyncHandler(async (req, r
 }));
 
 app.post('/api/assets/:id/assign', verifyToken, verifyHR, asyncHandler(async (req, res) => {
+    await connectDB();
     const { email: employeeEmail } = req.body;
     const { id: assetId } = req.params;
     const hrEmail = req.user.email;
@@ -779,6 +857,7 @@ app.post('/api/assets/:id/assign', verifyToken, verifyHR, asyncHandler(async (re
 }));
 
 app.post('/api/payments/create-checkout', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const { packageId, email } = req.body;
 
     if (!packageId || !email) {
@@ -869,39 +948,8 @@ const processPayment = async (sessionId, packageId, email, packageName, amountTo
     return transactionId;
 };
 
-app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-    let event;
-
-    try {
-        if (!webhookSecret) {
-            console.error('STRIPE_WEBHOOK_SECRET not set in environment variables');
-            event = JSON.parse(req.body.toString());
-        } else {
-            event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-        }
-    } catch (error) {
-        console.error('Webhook signature verification failed:', error.message);
-        return res.status(400).json({ error: `Webhook Error: ${error.message}` });
-    }
-
-    if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-
-        try {
-            const { packageId, email, packageName } = session.metadata;
-            await processPayment(session.id, packageId, email, packageName, session.amount_total);
-        } catch (error) {
-            console.error('Error processing webhook:', error);
-        }
-    }
-
-    res.json({ received: true });
-}));
-
 app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
+    await connectDB();
     const { sessionId } = req.params;
 
     try {
@@ -945,6 +993,7 @@ app.get('/api/payments/session/:sessionId', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const userEmail = req.user.email;
 
     const paymentHistory = await payments
@@ -967,6 +1016,7 @@ app.get('/api/payments/history', verifyToken, asyncHandler(async (req, res) => {
 }));
 
 app.delete('/api/payments/:id', verifyToken, asyncHandler(async (req, res) => {
+    await connectDB();
     const { id } = req.params;
     const result = await payments.deleteOne({ _id: new ObjectId(id) });
     if (result.deletedCount === 1) {
