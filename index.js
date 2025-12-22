@@ -25,6 +25,10 @@ app.use(cors({
     credentials: true
 }));
 
+app.get('/', (req, res) => {
+    res.send('AssetVerse Server is running!');
+});
+
 const asyncHandler = fn => (req, res, next) =>
     Promise.resolve(fn(req, res)).catch(next);
 
@@ -46,6 +50,21 @@ const client = new MongoClient(uri, {
 });
 
 let users, assets, packages, payments, requests, employeeAffiliations, assignedAssets;
+
+const getCollections = async () => {
+    if (!users) {
+        await client.connect();
+        const db = client.db('assetVerse');
+        users = db.collection('users');
+        assets = db.collection('assets');
+        packages = db.collection('packages');
+        payments = db.collection('payments');
+        requests = db.collection('requests');
+        employeeAffiliations = db.collection('employeeAffiliations');
+        assignedAssets = db.collection('assignedAssets');
+    }
+    return { users, assets, packages, payments, requests, employeeAffiliations, assignedAssets };
+};
 
 const verifyHR = (req, res, next) => {
     const role = req.user.role?.toLowerCase();
@@ -961,105 +980,4 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: err.message });
 });
 
-(async () => {
-    await client.connect();
-    const db = client.db('assetVerse');
-    users = db.collection('users');
-    assets = db.collection('assets');
-    packages = db.collection('packages');
-    payments = db.collection('payments');
-    requests = db.collection('requests');
-    employeeAffiliations = db.collection('employeeAffiliations');
-    assignedAssets = db.collection('assignedAssets');
-
-    // Init packages
-    const packageCount = await packages.countDocuments();
-    if (packageCount === 0) {
-        await packages.insertMany([
-            {
-                id: "free",
-                name: "Free",
-                price: 0,
-                employeeLimit: 3,
-                features: ["Asset Tracking", "Basic Support"],
-                createdAt: new Date()
-            },
-            {
-                id: "basic",
-                name: "Basic",
-                price: 5,
-                employeeLimit: 10,
-                features: ["Asset Tracking", "Employee Management", "Basic Support"],
-                createdAt: new Date()
-            },
-            {
-                id: "standard",
-                name: "Standard",
-                price: 8,
-                employeeLimit: 20,
-                features: ["All Basic features", "Advanced Analytics", "Priority Support"],
-                createdAt: new Date()
-            },
-            {
-                id: "premium",
-                name: "Premium",
-                price: 15,
-                employeeLimit: 30,
-                features: ["All Standard features", "Custom Branding", "24/7 Support"],
-                createdAt: new Date()
-            }
-        ]);
-    }
-
-    // Migration: Update existing HR users to 3 employee limit for free plan and ensure free package is set to 3
-    await Promise.all([
-        users.updateMany(
-            {
-                role: 'HR',
-                $or: [
-                    { subscription: { $exists: false } },
-                    { subscription: 'free', packageLimit: { $ne: 3 } }
-                ]
-            },
-            { $set: { packageLimit: 3, subscription: 'free', subscriptionDate: new Date(), updatedAt: new Date() } }
-        ),
-        packages.updateOne(
-            { id: 'free', employeeLimit: 5 },
-            { $set: { employeeLimit: 3 } }
-        )
-    ]);
-
-    // Migration logic
-    const employeesToMigrate = await users.find({ role: 'Employee', companies: { $exists: true, $not: { $size: 0 } } }).toArray();
-    for (const emp of employeesToMigrate) {
-        for (const company of emp.companies) {
-            const exists = await employeeAffiliations.findOne({
-                employeeEmail: emp.email,
-                hrEmail: company.hrEmail || company.email
-            });
-            if (!exists) {
-                await employeeAffiliations.insertOne({
-                    employeeEmail: emp.email,
-                    employeeName: emp.name,
-                    hrEmail: company.hrEmail || company.email,
-                    companyName: company.companyName,
-                    status: 'active',
-                    affiliationDate: company.joinedDate || new Date()
-                });
-            }
-        }
-    }
-
-    // Populate hrEmail in requests from asset info
-    const requestsToMigrate = await requests.find({ hrEmail: { $exists: false } }).toArray();
-    for (const req of requestsToMigrate) {
-        try {
-            const asset = await assets.findOne({ _id: new ObjectId(req.assetId) });
-            if (asset && asset.hrEmail) {
-                await requests.updateOne({ _id: req._id }, { $set: { hrEmail: asset.hrEmail } });
-            }
-        } catch (e) { }
-    }
-
-    // app.listen(port, () => { });
-})();
+module.exports = app;
