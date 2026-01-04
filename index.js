@@ -18,7 +18,6 @@ const jwtSecret = process.env.JWT_SECRET || 'your_default_secret_here';
 
 const admin = require("firebase-admin");
 
-// Initialize Firebase admin only when FB_SERVICE_KEY is provided and valid
 let serviceAccount;
 try {
     if (process.env.FB_SERVICE_KEY) {
@@ -37,7 +36,6 @@ try {
     console.error('Failed to initialize Firebase admin:', err);
 }
 
-// middleware
 app.use(express.json());
 app.use(cors());
 
@@ -47,7 +45,6 @@ const verifyToken = (req, res, next) => {
 
     jwt.verify(token, jwtSecret, (err, decoded) => {
         if (err) return res.status(401).json({ error: 'Invalid token' });
-        // Normalize role to lowercase to avoid case-sensitivity issues
         req.user = { ...decoded, role: String(decoded.role || '').toLowerCase() };
         next();
     });
@@ -55,7 +52,6 @@ const verifyToken = (req, res, next) => {
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.gtbyi48.mongodb.net/?retryWrites=true&w=majority`;
 
-// Global collections object to be populated after DB connection
 const collections = {
     userCollection: null,
     assetCollection: null,
@@ -81,10 +77,9 @@ const client = new MongoClient(uri, {
     }
 });
 
-// Separate DB connection logic for serverless re-use
 let cachedClient = null;
 async function connectDB() {
-    if (collections.userCollection) return; // Already connected
+    if (collections.userCollection) return;
 
     try {
         await client.connect();
@@ -99,14 +94,12 @@ async function connectDB() {
         collections.employeeAffiliationCollection = db.collection('employeeAffiliations');
         collections.assignedAssetCollection = db.collection('assignedAssets');
 
-        // Update controller instances with the real collections
         [authController, assetController, employeeController, requestController, paymentController].forEach(c => {
             Object.keys(collections).forEach(key => {
                 c[key] = collections[key];
             });
         });
 
-        // Initialize packages if empty
         const packageCount = await collections.packageCollection.countDocuments();
         if (packageCount === 0) {
             await collections.packageCollection.insertMany([
@@ -141,7 +134,6 @@ async function connectDB() {
     }
 }
 
-// Ensure DB is connected before processing requests
 const ensureDb = async (req, res, next) => {
     if (!collections.userCollection) {
         await connectDB();
@@ -204,17 +196,14 @@ app.get('/api/packages', ensureDb, async (req, res) => {
 
 app.get('/api/hr/analytics', verifyToken, verifyHR, ensureDb, (req, res) => assetController.getAnalytics(req, res));
 
-// Debug endpoint to inspect authenticated user and DB connection
 app.get('/api/debug/me', verifyToken, ensureDb, (req, res) => {
     res.json({ user: req.user, dbConnected: !!collections.userCollection });
 });
 
-// requests management
 app.post('/api/requests', verifyToken, ensureDb, (req, res) => requestController.createRequest(req, res));
 app.get('/api/requests', verifyToken, verifyHR, ensureDb, (req, res) => requestController.getRequests(req, res));
 app.patch('/api/requests/:id', verifyToken, verifyHR, ensureDb, (req, res) => requestController.processRequest(req, res));
 
-// Get assigned assets for employee
 app.get('/api/employee-assets', verifyToken, ensureDb, (req, res) => employeeController.getEmployeeAssets(req, res));
 app.post('/api/employee-assets/:id/return', verifyToken, ensureDb, (req, res) => employeeController.returnAsset(req, res));
 app.delete('/api/employee-assets/:id', verifyToken, ensureDb, (req, res) => employeeController.deleteEmployeeAsset(req, res));
@@ -227,14 +216,12 @@ app.get('/payments', verifyToken, ensureDb, (req, res) => paymentController.getP
 app.get('/api/payments/history', verifyToken, ensureDb, (req, res) => paymentController.getPaymentHistory(req, res));
 app.delete('/api/payments/:id', verifyToken, ensureDb, (req, res) => paymentController.deletePayment(req, res));
 
-// Start server for local development
 if (process.env.NODE_ENV !== 'production') {
     app.listen(port, () => {
         console.log(`Server listening on port ${port}`)
     });
 }
 
-// Always try to connect on startup for warm lambdas
 connectDB();
 
 module.exports = app;

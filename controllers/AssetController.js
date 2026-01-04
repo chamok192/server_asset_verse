@@ -16,7 +16,6 @@ class AssetController {
             const userEmail = req.user.email.toLowerCase();
 
             if (role === 'hr') {
-                // For HR, show only assets added by this HR
                 query.hrEmail = userEmail;
             } else if (role === 'employee') {
                 if (req.query.quantity === 'available') {
@@ -25,7 +24,6 @@ class AssetController {
                         { availableQuantity: { $exists: false }, quantity: { $gt: 0 } }
                     ];
                 }
-                // For employees, show all assets when not filtering by available
             } else {
                 return res.json({ data: [], totalPages: 0, totalAssets: 0, totalQuantity: 0, lowStock: 0 });
             }
@@ -49,7 +47,6 @@ class AssetController {
 
             const assetsList = await this.assetCollection.find(query).skip(skip).limit(limit).toArray();
 
-            // Fix availableQuantity for legacy assets
             for (const asset of assetsList) {
                 const correctAvailable = asset.availableQuantity ?? asset.quantity ?? asset.productQuantity ?? 0;
                 if (asset.availableQuantity === undefined || asset.availableQuantity < 0 || asset.availableQuantity !== correctAvailable) {
@@ -83,7 +80,7 @@ class AssetController {
             ]).toArray();
 
             const summary = summaryResult[0] || { totalQuantity: 0, totalAvailable: 0, lowStockCount: 0 };
-            const totalQuantity = summary.totalAvailable; // "In Stock" usually means available
+            const totalQuantity = summary.totalAvailable;
             const lowStock = summary.lowStockCount;
             const totalPages = Math.ceil(totalAssets / limit);
 
@@ -93,7 +90,7 @@ class AssetController {
                 totalAssets,
                 totalQuantity,
                 lowStock,
-                totalUnits: summary.totalQuantity // Extra info for total capacity
+                totalUnits: summary.totalQuantity
             });
         } catch (error) {
             res.status(500).json({ error: error.message });
@@ -105,10 +102,9 @@ class AssetController {
             const id = req.params.id;
             const result = await this.assetCollection.findOne({ _id: new ObjectId(id) });
             if (result) {
-                // Ensure field consistency for frontend
-                result.quantity = result.productQuantity ?? result.quantity ?? result.availableQuantity ?? 0;
-                result.productQuantity = result.quantity;
-                result.availableQuantity = result.availableQuantity ?? result.quantity;
+            result.quantity = result.productQuantity ?? result.quantity ?? result.availableQuantity ?? 0;
+            result.productQuantity = result.quantity;
+            result.availableQuantity = result.availableQuantity ?? result.quantity;
             }
             res.send(result);
         } catch (error) {
@@ -143,21 +139,18 @@ class AssetController {
             const asset = await this.assetCollection.findOne({ _id: new ObjectId(id) });
             if (!asset) return res.status(404).json({ error: 'Asset not found' });
 
-            // Check if HR owns this asset
             if (req.user.role === 'hr') {
                 if (asset.hrEmail !== req.user.email) {
                     return res.status(403).json({ error: 'Forbidden' });
                 }
             }
 
-            // Normalize and determine changes
             const oldQty = Number(asset.productQuantity ?? asset.quantity ?? 0);
             const newQty = Number(updateData.quantity ?? updateData.productQuantity ?? oldQty);
             const diff = newQty - oldQty;
 
             const finalUpdate = { ...updateData };
 
-            // Ensure both field variants are updated for consistency
             if (updateData.name || updateData.productName) {
                 const val = updateData.name || updateData.productName;
                 finalUpdate.name = finalUpdate.productName = val;
@@ -171,7 +164,6 @@ class AssetController {
                 finalUpdate.image = finalUpdate.productImage = val;
             }
 
-            // Sync quantity and availableQuantity
             finalUpdate.quantity = finalUpdate.productQuantity = newQty;
             const currentAvailable = Number(asset.availableQuantity ?? oldQty);
             finalUpdate.availableQuantity = Math.max(0, currentAvailable + diff);

@@ -34,14 +34,12 @@ class AuthController {
             const user = await this.userCollection.findOne({ email });
             if (!user) return res.status(404).json({ error: 'User not found' });
 
-            // For employees, include affiliation data
             if (user.role === 'employee') {
                 const affiliations = await this.employeeAffiliationCollection.find({
                     employeeEmail: { $regex: new RegExp(`^${email}$`, 'i') },
                     status: 'active'
                 }).toArray();
 
-                // Get HR details for each affiliation
                 const affiliationsWithHR = [];
                 for (const aff of affiliations) {
                     const hr = await this.userCollection.findOne(
@@ -129,14 +127,12 @@ class AuthController {
                 }
             }
 
-            // For employees, include affiliation data
             if (user.role && String(user.role).toLowerCase() === 'employee') {
                 const affiliations = await this.employeeAffiliationCollection.find({
                     employeeEmail: { $regex: new RegExp(`^${email}$`, 'i') },
                     status: 'active'
                 }).toArray();
 
-                // Get HR details for each affiliation
                 const affiliationsWithHR = [];
                 for (const aff of affiliations) {
                     const hr = await this.userCollection.findOne(
