@@ -14,6 +14,9 @@ class PaymentController {
             const pkg = await this.packageCollection.findOne({ id: packageInfo.packageId });
             if (!pkg) return res.status(404).send({ error: 'Package not found' });
 
+            // Strip trailing slash from FRONTEND_URL to avoid double slashes
+            const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
+
             const amount = parseInt(pkg.price) * 100;
             const session = await stripe.checkout.sessions.create({
                 line_items: [
@@ -34,10 +37,13 @@ class PaymentController {
                     email: packageInfo.email
                 },
                 customer_email: packageInfo.email,
-                success_url: `${process.env.FRONTEND_URL}/hr/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-                cancel_url: `${process.env.FRONTEND_URL}/hr/upgrade`,
+                success_url: `${frontendUrl}/hr/payments?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+                cancel_url: `${frontendUrl}/hr/upgrade`,
+                
+                locale: 'en'
             });
 
+            console.log('Created checkout session:', { id: session.id, url: session.url, metadata: session.metadata });
             res.send({ url: session.url });
         } catch (error) {
             res.status(500).json({ error: error.message });
@@ -52,7 +58,7 @@ class PaymentController {
             console.log('Processing payment for session:', sessionId);
 
             const session = await stripe.checkout.sessions.retrieve(sessionId);
-            console.log('Session retrieved:', { id: session.id, payment_status: session.payment_status, payment_intent: session.payment_intent });
+            console.log('Session retrieved:', { id: session.id, payment_status: session.payment_status, payment_intent: session.payment_intent, metadata: session.metadata });
 
             const transactionId = session.payment_intent || session.id;
             const query = { transactionId: transactionId };
@@ -122,8 +128,8 @@ class PaymentController {
                     }
                 });
             }
-            console.log('Payment not completed, status:', session.payment_status);
-            return res.send({ success: false, error: 'Payment not completed' });
+            console.log('Payment not completed, status:', session.payment_status, 'session:', session);
+            return res.send({ success: false, error: `Payment not completed: ${session.payment_status || 'unknown'}` });
         } catch (error) {
             console.error('Error in payment-success:', error);
             res.send({ success: false, error: error.message });
